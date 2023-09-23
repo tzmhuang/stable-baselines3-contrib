@@ -31,3 +31,27 @@ class RecurrentDictRolloutBufferSamples(NamedTuple):
     lstm_states: RNNStates
     episode_starts: th.Tensor
     mask: th.Tensor
+
+class RecurrentRolloutBufferAtGoalSamples(NamedTuple):
+    observations: th.Tensor
+    actions: th.Tensor
+    at_goals: th.Tensor
+    old_values: th.Tensor
+    old_log_prob: th.Tensor
+    advantages: th.Tensor
+    returns: th.Tensor
+    lstm_states: RNNStates
+    episode_starts: th.Tensor
+    mask: th.Tensor
+
+class RecurrentRolloutBufferNextObsSamples(NamedTuple):
+    observations: th.Tensor
+    next_observations: th.Tensor
+    actions: th.Tensor
+    old_values: th.Tensor
+    old_log_prob: th.Tensor
+    advantages: th.Tensor
+    returns: th.Tensor
+    lstm_states: RNNStates
+    episode_starts: th.Tensor
+    mask: th.Tensor

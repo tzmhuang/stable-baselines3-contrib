@@ -12,18 +12,6 @@ from stable_baselines3.common.torch_layers import (
     MlpExtractor,
     NatureCNN,
 )
-
-from stable_baselines3.common.distributions import (
-    BernoulliDistribution,
-    CategoricalDistribution,
-    DiagGaussianDistribution,
-    Distribution,
-    MultiCategoricalDistribution,
-    StateDependentNoiseDistribution,
-    make_proba_distribution,
-)
-from functools import partial
-
 from stable_baselines3.common.type_aliases import Schedule
 from stable_baselines3.common.utils import zip_strict
 from stable_baselines3.common.preprocessing import get_action_dim, get_obs_shape
@@ -31,9 +19,8 @@ from stable_baselines3.common.preprocessing import get_action_dim, get_obs_shape
 from torch import nn
 
 from sb3_contrib.common.recurrent.type_aliases import RNNStates
-# from sb3_contrib.ppo_recurrent.disagreement_curiosity import Disagreement
-# from sb3_contrib.ppo_recurrent.ema_exploration import EmaExplorer
-from sb3_contrib.ppo_recurrent.misc_modules import Disagreement, EmaExplorer, AtGoalPredictor
+from sb3_contrib.ppo_recurrent.disagreement_curiosity import Disagreement
+from sb3_contrib.ppo_recurrent.ema_exploration import EmaExplorer
 
 
 class RecurrentActorCriticPolicy(ActorCriticPolicy):
@@ -106,16 +93,8 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         curiosity_kwargs: Optional[Dict[str, Any]] = None,
         enable_ema: bool = False,
         ema_kwargs: Optional[Dict[str, Any]] = None,
-        train_pred_at_goal: bool = True,
     ):
         self.lstm_output_dim = lstm_hidden_size
-        self.enable_curiosity = enable_curiosity
-        self.enable_ema = enable_ema
-        self.train_pred_at_goal = train_pred_at_goal
-
-        self.curiosity_kwargs = curiosity_kwargs
-        self.ema_kwargs = ema_kwargs
-
         super().__init__(
             observation_space,
             action_space,
@@ -182,6 +161,22 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
             if name.startswith("weight"): nn.init.orthogonal_(param, gain=np.sqrt(2))
             if name.startswith("bias"): nn.init.zeros_(param)
 
+        # Add curiosity module
+        self.enable_curiosity = enable_curiosity
+        if self.enable_curiosity:
+            assert curiosity_kwargs != None
+
+            self.curious_agent = Disagreement(obs_dim=get_obs_shape(self.observation_space), 
+                                            action_dim=get_action_dim(self.action_space), 
+                                            **curiosity_kwargs)
+
+        # Add ema module
+        self.enable_ema = enable_ema
+        if self.enable_ema:
+            assert ema_kwargs != None
+
+            self.ema_explorer = EmaExplorer(**ema_kwargs)
+
 
         # Setup optimizer with initial learning rate
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
@@ -197,82 +192,6 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
             activation_fn=self.activation_fn,
             device=self.device,
         )
-
-
-    def _build_misc_modules(self) -> None:
-        # Add curiosity module
-        if self.enable_curiosity:
-            assert self.curiosity_kwargs != None
-            self.curious_agent = Disagreement(obs_dim=get_obs_shape(self.observation_space), 
-                                            action_dim=get_action_dim(self.action_space), 
-                                            **curiosity_kwargs)
-
-        # Add ema module
-        if self.enable_ema:
-            assert self.ema_kwargs != None
-            self.ema_explorer = EmaExplorer(**ema_kwargs)
-        
-        # Add at_goal module
-        self.at_goal_predictor = AtGoalPredictor(self.lstm_output_dim, self.features_dim, output_dim=2) # 2-class
-        self.at_goal_dist = CategoricalDistribution(action_dim=2)   # 2-class
-
-        for name, param in self.at_goal_predictor.named_parameters():
-            if name.startswith("weight"): nn.init.orthogonal_(param, gain=0.01)
-            if name.startswith("bias"): nn.init.zeros_(param)
-
-        
-
-    def _build(self, lr_schedule: Schedule) -> None:
-        """
-        Create the networks and the optimizer.
-
-        :param lr_schedule: Learning rate schedule
-            lr_schedule(1) is the initial learning rate
-        """
-        self._build_mlp_extractor()
-        self._build_misc_modules()
-
-        latent_dim_pi = self.mlp_extractor.latent_dim_pi
-
-        if isinstance(self.action_dist, DiagGaussianDistribution):
-            self.action_net, self.log_std = self.action_dist.proba_distribution_net(
-                latent_dim=latent_dim_pi, log_std_init=self.log_std_init
-            )
-        elif isinstance(self.action_dist, StateDependentNoiseDistribution):
-            self.action_net, self.log_std = self.action_dist.proba_distribution_net(
-                latent_dim=latent_dim_pi, latent_sde_dim=latent_dim_pi, log_std_init=self.log_std_init
-            )
-        elif isinstance(self.action_dist, (CategoricalDistribution, MultiCategoricalDistribution, BernoulliDistribution)):
-            self.action_net = self.action_dist.proba_distribution_net(latent_dim=latent_dim_pi)
-        else:
-            raise NotImplementedError(f"Unsupported distribution '{self.action_dist}'.")
-
-        self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, 1)
-        # Init weights: use orthogonal initialization
-        # with small initial weight for the output
-        if self.ortho_init:
-            # TODO: check for features_extractor
-            # Values from stable-baselines.
-            # features_extractor/mlp values are
-            # originally from openai/baselines (default gains/init_scales).
-            module_gains = {
-                self.features_extractor: np.sqrt(2),
-                self.mlp_extractor: np.sqrt(2),
-                self.action_net: 0.01,
-                self.value_net: 1,
-            }
-            if not self.share_features_extractor:
-                # Note(antonin): this is to keep SB3 results
-                # consistent, see GH#1148
-                del module_gains[self.features_extractor]
-                module_gains[self.pi_features_extractor] = np.sqrt(2)
-                module_gains[self.vf_features_extractor] = np.sqrt(2)
-
-            for module, gain in module_gains.items():
-                module.apply(partial(self.init_weights, gain=gain))
-
-        # Setup optimizer with initial learning rate
-        self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
 
     @staticmethod
     def _process_sequence(
@@ -361,17 +280,6 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
             latent_vf = self.critic(vf_features)
             lstm_states_vf = lstm_states_pi
 
-
-        # predict at_goal probability
-        at_goal_logit = self.at_goal_predictor(latent_pi) # n_envs, 2
-
-        at_goal_dist = self.at_goal_dist.proba_distribution(action_logits=at_goal_logit)
-        at_goals = at_goal_dist.get_actions(deterministic=deterministic)
-        at_goal_log_prob = at_goal_dist.log_prob(at_goals)
-
-        at_goals = at_goals.reshape(-1, 1)  # n_env, 1
-
-
         latent_pi = self.mlp_extractor.forward_actor(latent_pi)
         latent_vf = self.mlp_extractor.forward_critic(latent_vf)
 
@@ -381,18 +289,8 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
 
-        # combine log_prob
-
-        if self.train_pred_at_goal:
-            log_prob += at_goal_log_prob
-
-
-        agent_output = {
-            'actions': actions,
-            'at_goals': at_goals
-        }
-
-        return agent_output, values, log_prob, RNNStates(lstm_states_pi, lstm_states_vf)
+        
+        return actions, values, log_prob, RNNStates(lstm_states_pi, lstm_states_vf)
 
     def get_distribution(
         self,
@@ -414,35 +312,6 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         latent_pi, lstm_states = self._process_sequence(features, lstm_states, episode_starts, self.lstm_actor)
         latent_pi = self.mlp_extractor.forward_actor(latent_pi)
         return self._get_action_dist_from_latent(latent_pi), lstm_states
-
-    def get_at_goal_dist(
-        self,
-        obs: th.Tensor,
-        lstm_states: Tuple[th.Tensor, th.Tensor],
-        episode_starts: th.Tensor,
-    ) -> Tuple[Distribution, Tuple[th.Tensor, ...]]:
-        """
-        Get the current policy distribution given the observations.
-
-        :param obs: Observation.
-        :param lstm_states: The last hidden and memory states for the LSTM.
-        :param episode_starts: Whether the observations correspond to new episodes
-            or not (we reset the lstm states in that case).
-        :return: the action distribution and new hidden states.
-        """
-        # Call the method from the parent of the parent class
-        features = super(ActorCriticPolicy, self).extract_features(obs, self.pi_features_extractor)
-        latent_pi, lstm_states = self._process_sequence(features, lstm_states, episode_starts, self.lstm_actor)
-
-        at_goal_logit = self.at_goal_predictor(latent_pi) # n_envs, 2
-
-        # print('-'*20)
-        # print(at_goal_logit)
-        # print('-'*20)
-        at_goal_dist = self.at_goal_dist.proba_distribution(action_logits=at_goal_logit)
-
-        return at_goal_dist, lstm_states
-
 
     def predict_values(
         self,
@@ -475,7 +344,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         return self.value_net(latent_vf)
 
     def evaluate_actions(
-        self, obs: th.Tensor, actions: th.Tensor, at_goal: th.Tensor, lstm_states: RNNStates, episode_starts: th.Tensor
+        self, obs: th.Tensor, actions: th.Tensor, lstm_states: RNNStates, episode_starts: th.Tensor
     ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         Evaluate actions according to the current policy,
@@ -503,25 +372,11 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         else:
             latent_vf = self.critic(vf_features)
 
-
-        # predict at_goal probability
-        at_goal_logit = self.at_goal_predictor(latent_pi) # n_envs, 2
-        at_goal_dist = self.at_goal_dist.proba_distribution(action_logits=at_goal_logit)
-        at_goal = at_goal.squeeze() # n_env, 1 -> n_env
-        at_goal_log_prob = at_goal_dist.log_prob(at_goal)
-
-
         latent_pi = self.mlp_extractor.forward_actor(latent_pi)
         latent_vf = self.mlp_extractor.forward_critic(latent_vf)
 
         distribution = self._get_action_dist_from_latent(latent_pi)
         log_prob = distribution.log_prob(actions)
-
-        # combine logprob NOTE: we ignore joint entropy
-        if self.train_pred_at_goal:
-            log_prob += at_goal_log_prob
-
-
         values = self.value_net(latent_vf)
         return values, log_prob, distribution.entropy()
 
@@ -543,13 +398,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         :return: Taken action according to the policy and hidden states of the RNN
         """
         distribution, lstm_states = self.get_distribution(observation, lstm_states, episode_starts)
-        at_goal_dist, _ = self.get_at_goal_dist(observation, lstm_states, episode_starts)
-
-        actions = distribution.get_actions(deterministic=deterministic)
-        at_goals = at_goal_dist.get_actions(deterministic=deterministic)
-        at_goals = at_goals.reshape(-1, 1)  # n_env, 1
-
-        return actions, at_goals, lstm_states
+        return distribution.get_actions(deterministic=deterministic), lstm_states
 
     def predict(
         self,
@@ -575,9 +424,6 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
         observation, vectorized_env = self.obs_to_tensor(observation)
 
-        print("-"*20)
-        print(observation[:,[2,3,5,6,7]])
-
         if isinstance(observation, dict):
             n_envs = observation[list(observation.keys())[0]].shape[0]
         else:
@@ -597,14 +443,13 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
                 state[1], dtype=th.float32, device=self.device
             )
             episode_starts = th.tensor(episode_start, dtype=th.float32, device=self.device)
-            actions, at_goals, states = self._predict(
+            actions, states = self._predict(
                 observation, lstm_states=states, episode_starts=episode_starts, deterministic=deterministic
             )
             states = (states[0].cpu().numpy(), states[1].cpu().numpy())
 
         # Convert to numpy
         actions = actions.cpu().numpy()
-        at_goals = at_goals.cpu().numpy()
 
         if isinstance(self.action_space, spaces.Box):
             if self.squash_output:
@@ -619,11 +464,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         if not vectorized_env:
             actions = actions.squeeze(axis=0)
 
-        agent_output = {
-            'actions': actions,
-            'at_goals': at_goals
-        }
-        return agent_output, states
+        return actions, states
 
 
 class RecurrentActorCriticCnnPolicy(RecurrentActorCriticPolicy):

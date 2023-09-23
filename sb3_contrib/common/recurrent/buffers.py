@@ -10,6 +10,8 @@ from stable_baselines3.common.vec_env import VecNormalize
 from sb3_contrib.common.recurrent.type_aliases import (
     RecurrentDictRolloutBufferSamples,
     RecurrentRolloutBufferSamples,
+    RecurrentRolloutBufferAtGoalSamples,
+    RecurrentRolloutBufferNextObsSamples,
     RNNStates,
 )
 
@@ -240,6 +242,397 @@ class RecurrentRolloutBuffer(RolloutBuffer):
             mask=self.pad_and_flatten(np.ones_like(self.returns[batch_inds])),
         )
 
+class RecurrentRolloutBufferAtGoal(RolloutBuffer):
+    """
+    Rollout buffer that also stores the LSTM cell and hidden states.
+
+    :param buffer_size: Max number of element in the buffer
+    :param observation_space: Observation space
+    :param action_space: Action space
+    :param hidden_state_shape: Shape of the buffer that will collect lstm states
+        (n_steps, lstm.num_layers, n_envs, lstm.hidden_size)
+    :param device: PyTorch device
+    :param gae_lambda: Factor for trade-off of bias vs variance for Generalized Advantage Estimator
+        Equivalent to classic advantage when set to 1.
+    :param gamma: Discount factor
+    :param n_envs: Number of parallel environments
+    """
+
+    def __init__(
+        self,
+        buffer_size: int,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        hidden_state_shape: Tuple[int, int, int, int],
+        device: Union[th.device, str] = "auto",
+        gae_lambda: float = 1,
+        gamma: float = 0.99,
+        n_envs: int = 1,
+    ):
+        self.hidden_state_shape = hidden_state_shape
+        self.seq_start_indices, self.seq_end_indices = None, None
+        super().__init__(buffer_size, observation_space, action_space, device, gae_lambda, gamma, n_envs)
+
+    def reset(self):
+        super().reset()
+
+        self.at_goals = np.zeros((self.buffer_size, self.n_envs, 1), dtype=np.int)  # 0 or 1
+
+        self.hidden_states_pi = np.zeros(self.hidden_state_shape, dtype=np.float32)
+        self.cell_states_pi = np.zeros(self.hidden_state_shape, dtype=np.float32)
+        self.hidden_states_vf = np.zeros(self.hidden_state_shape, dtype=np.float32)
+        self.cell_states_vf = np.zeros(self.hidden_state_shape, dtype=np.float32)
+
+    def _add(
+        self,
+        obs: np.ndarray,
+        action: np.ndarray,
+        at_goals: np.array,
+        reward: np.ndarray,
+        episode_start: np.ndarray,
+        value: th.Tensor,
+        log_prob: th.Tensor,
+    ) -> None:
+        """
+        :param obs: Observation
+        :param action: Action
+        :param reward:
+        :param episode_start: Start of episode signal.
+        :param value: estimated value of the current state
+            following the current policy.
+        :param log_prob: log probability of the action
+            following the current policy.
+        """
+        if len(log_prob.shape) == 0:
+            # Reshape 0-d tensor to avoid error
+            log_prob = log_prob.reshape(-1, 1)
+
+        # Reshape needed when using multiple envs with discrete observations
+        # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
+        if isinstance(self.observation_space, spaces.Discrete):
+            obs = obs.reshape((self.n_envs, *self.obs_shape))
+            next_obs = next_obs.reshape((self.n_envs, *self.obs_shape))
+
+        # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
+        action = action.reshape((self.n_envs, self.action_dim))
+        at_goals = at_goals.reshape((self.n_envs, 1))
+
+        self.observations[self.pos] = np.array(obs).copy()
+        self.actions[self.pos] = np.array(action).copy()
+        self.at_goals[self.pos] = np.array(at_goals).copy()
+        self.rewards[self.pos] = np.array(reward).copy()
+        self.episode_starts[self.pos] = np.array(episode_start).copy()
+        self.values[self.pos] = value.clone().cpu().numpy().flatten()
+        self.log_probs[self.pos] = log_prob.clone().cpu().numpy()
+        self.pos += 1
+        if self.pos == self.buffer_size:
+            self.full = True
+
+    def add(self, *args, lstm_states: RNNStates, **kwargs) -> None:
+        """
+        :param hidden_states: LSTM cell and hidden state
+        """
+        self.hidden_states_pi[self.pos] = np.array(lstm_states.pi[0].cpu().numpy())
+        self.cell_states_pi[self.pos] = np.array(lstm_states.pi[1].cpu().numpy())
+        self.hidden_states_vf[self.pos] = np.array(lstm_states.vf[0].cpu().numpy())
+        self.cell_states_vf[self.pos] = np.array(lstm_states.vf[1].cpu().numpy())
+
+        self._add(*args, **kwargs)
+
+    def get(self, batch_size: Optional[int] = None) -> Generator[RecurrentRolloutBufferSamples, None, None]:
+        assert self.full, "Rollout buffer must be full before sampling from it"
+
+        # Prepare the data
+        if not self.generator_ready:
+            # hidden_state_shape = (self.n_steps, lstm.num_layers, self.n_envs, lstm.hidden_size)
+            # swap first to (self.n_steps, self.n_envs, lstm.num_layers, lstm.hidden_size)
+            for tensor in ["hidden_states_pi", "cell_states_pi", "hidden_states_vf", "cell_states_vf"]:
+                self.__dict__[tensor] = self.__dict__[tensor].swapaxes(1, 2)
+
+            # flatten but keep the sequence order
+            # 1. (n_steps, n_envs, *tensor_shape) -> (n_envs, n_steps, *tensor_shape)
+            # 2. (n_envs, n_steps, *tensor_shape) -> (n_envs * n_steps, *tensor_shape)
+            for tensor in [
+                "observations",
+                "actions",
+                "at_goals",
+                "values",
+                "log_probs",
+                "advantages",
+                "returns",
+                "hidden_states_pi",
+                "cell_states_pi",
+                "hidden_states_vf",
+                "cell_states_vf",
+                "episode_starts",
+            ]:
+                self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
+            self.generator_ready = True
+
+        # Return everything, don't create minibatches
+        if batch_size is None:
+            batch_size = self.buffer_size * self.n_envs
+
+        # Sampling strategy that allows any mini batch size but requires
+        # more complexity and use of padding
+        # Trick to shuffle a bit: keep the sequence order
+        # but split the indices in two
+        split_index = np.random.randint(self.buffer_size * self.n_envs)
+        indices = np.arange(self.buffer_size * self.n_envs)
+        indices = np.concatenate((indices[split_index:], indices[:split_index]))
+
+        env_change = np.zeros(self.buffer_size * self.n_envs).reshape(self.buffer_size, self.n_envs)
+        # Flag first timestep as change of environment
+        env_change[0, :] = 1.0
+        env_change = self.swap_and_flatten(env_change)
+
+        start_idx = 0
+        while start_idx < self.buffer_size * self.n_envs:
+            batch_inds = indices[start_idx : start_idx + batch_size]
+            yield self._get_samples(batch_inds, env_change)
+            start_idx += batch_size
+
+    def _get_samples(
+        self,
+        batch_inds: np.ndarray,
+        env_change: np.ndarray,
+        env: Optional[VecNormalize] = None,
+    ) -> RecurrentRolloutBufferAtGoalSamples:
+        # Retrieve sequence starts and utility function
+        self.seq_start_indices, self.pad, self.pad_and_flatten = create_sequencers(
+            self.episode_starts[batch_inds], env_change[batch_inds], self.device
+        )
+
+        # Number of sequences
+        n_seq = len(self.seq_start_indices)
+        max_length = self.pad(self.actions[batch_inds]).shape[1]
+        padded_batch_size = n_seq * max_length
+        # We retrieve the lstm hidden states that will allow
+        # to properly initialize the LSTM at the beginning of each sequence
+        lstm_states_pi = (
+            # 1. (n_envs * n_steps, n_layers, dim) -> (batch_size, n_layers, dim)
+            # 2. (batch_size, n_layers, dim)  -> (n_seq, n_layers, dim)
+            # 3. (n_seq, n_layers, dim) -> (n_layers, n_seq, dim)
+            self.hidden_states_pi[batch_inds][self.seq_start_indices].swapaxes(0, 1),
+            self.cell_states_pi[batch_inds][self.seq_start_indices].swapaxes(0, 1),
+        )
+        lstm_states_vf = (
+            # (n_envs * n_steps, n_layers, dim) -> (n_layers, n_seq, dim)
+            self.hidden_states_vf[batch_inds][self.seq_start_indices].swapaxes(0, 1),
+            self.cell_states_vf[batch_inds][self.seq_start_indices].swapaxes(0, 1),
+        )
+        lstm_states_pi = (self.to_torch(lstm_states_pi[0]).contiguous(), self.to_torch(lstm_states_pi[1]).contiguous())
+        lstm_states_vf = (self.to_torch(lstm_states_vf[0]).contiguous(), self.to_torch(lstm_states_vf[1]).contiguous())
+
+        return RecurrentRolloutBufferAtGoalSamples(
+            # (batch_size, obs_dim) -> (n_seq, max_length, obs_dim) -> (n_seq * max_length, obs_dim)
+            observations=self.pad(self.observations[batch_inds]).reshape((padded_batch_size, *self.obs_shape)),
+            actions=self.pad(self.actions[batch_inds]).reshape((padded_batch_size,) + self.actions.shape[1:]),
+            at_goals=self.pad(self.at_goals[batch_inds]).reshape((padded_batch_size,) + self.at_goals.shape[1:]),
+            old_values=self.pad_and_flatten(self.values[batch_inds]),
+            old_log_prob=self.pad_and_flatten(self.log_probs[batch_inds]),
+            advantages=self.pad_and_flatten(self.advantages[batch_inds]),
+            returns=self.pad_and_flatten(self.returns[batch_inds]),
+            lstm_states=RNNStates(lstm_states_pi, lstm_states_vf),
+            episode_starts=self.pad_and_flatten(self.episode_starts[batch_inds]),
+            mask=self.pad_and_flatten(np.ones_like(self.returns[batch_inds])),
+        )
+
+
+class RecurrentRolloutBufferNextObs(RolloutBuffer):
+    """
+    Rollout buffer that also stores the LSTM cell and hidden states.
+
+    :param buffer_size: Max number of element in the buffer
+    :param observation_space: Observation space
+    :param action_space: Action space
+    :param hidden_state_shape: Shape of the buffer that will collect lstm states
+        (n_steps, lstm.num_layers, n_envs, lstm.hidden_size)
+    :param device: PyTorch device
+    :param gae_lambda: Factor for trade-off of bias vs variance for Generalized Advantage Estimator
+        Equivalent to classic advantage when set to 1.
+    :param gamma: Discount factor
+    :param n_envs: Number of parallel environments
+    """
+
+    def __init__(
+        self,
+        buffer_size: int,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        hidden_state_shape: Tuple[int, int, int, int],
+        device: Union[th.device, str] = "auto",
+        gae_lambda: float = 1,
+        gamma: float = 0.99,
+        n_envs: int = 1,
+    ):
+        self.hidden_state_shape = hidden_state_shape
+        self.seq_start_indices, self.seq_end_indices = None, None
+        self.next_observations = None
+        super().__init__(buffer_size, observation_space, action_space, device, gae_lambda, gamma, n_envs)
+
+    def reset(self):
+        super().reset()
+        self.next_observations = np.zeros((self.buffer_size, self.n_envs, *self.obs_shape), dtype=np.float32)
+
+        self.hidden_states_pi = np.zeros(self.hidden_state_shape, dtype=np.float32)
+        self.cell_states_pi = np.zeros(self.hidden_state_shape, dtype=np.float32)
+        self.hidden_states_vf = np.zeros(self.hidden_state_shape, dtype=np.float32)
+        self.cell_states_vf = np.zeros(self.hidden_state_shape, dtype=np.float32)
+
+    def _add(
+        self,
+        obs: np.ndarray,
+        next_obs: np.ndarray,
+        action: np.ndarray,
+        reward: np.ndarray,
+        episode_start: np.ndarray,
+        value: th.Tensor,
+        log_prob: th.Tensor,
+    ) -> None:
+        """
+        :param obs: Observation
+        :param action: Action
+        :param reward:
+        :param episode_start: Start of episode signal.
+        :param value: estimated value of the current state
+            following the current policy.
+        :param log_prob: log probability of the action
+            following the current policy.
+        """
+        if len(log_prob.shape) == 0:
+            # Reshape 0-d tensor to avoid error
+            log_prob = log_prob.reshape(-1, 1)
+
+        # Reshape needed when using multiple envs with discrete observations
+        # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
+        if isinstance(self.observation_space, spaces.Discrete):
+            obs = obs.reshape((self.n_envs, *self.obs_shape))
+            next_obs = next_obs.reshape((self.n_envs, *self.obs_shape))
+
+        # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
+        action = action.reshape((self.n_envs, self.action_dim))
+
+        self.observations[self.pos] = np.array(obs).copy()
+        self.next_observations[self.pos] = np.array(next_obs).copy()
+        self.actions[self.pos] = np.array(action).copy()
+        self.rewards[self.pos] = np.array(reward).copy()
+        self.episode_starts[self.pos] = np.array(episode_start).copy()
+        self.values[self.pos] = value.clone().cpu().numpy().flatten()
+        self.log_probs[self.pos] = log_prob.clone().cpu().numpy()
+        self.pos += 1
+        if self.pos == self.buffer_size:
+            self.full = True
+
+    def add(self, *args, lstm_states: RNNStates, **kwargs) -> None:
+        """
+        :param hidden_states: LSTM cell and hidden state
+        """
+        self.hidden_states_pi[self.pos] = np.array(lstm_states.pi[0].cpu().numpy())
+        self.cell_states_pi[self.pos] = np.array(lstm_states.pi[1].cpu().numpy())
+        self.hidden_states_vf[self.pos] = np.array(lstm_states.vf[0].cpu().numpy())
+        self.cell_states_vf[self.pos] = np.array(lstm_states.vf[1].cpu().numpy())
+
+        self._add(*args, **kwargs)
+
+    def get(self, batch_size: Optional[int] = None) -> Generator[RecurrentRolloutBufferNextObsSamples, None, None]:
+        assert self.full, "Rollout buffer must be full before sampling from it"
+
+        # Prepare the data
+        if not self.generator_ready:
+            # hidden_state_shape = (self.n_steps, lstm.num_layers, self.n_envs, lstm.hidden_size)
+            # swap first to (self.n_steps, self.n_envs, lstm.num_layers, lstm.hidden_size)
+            for tensor in ["hidden_states_pi", "cell_states_pi", "hidden_states_vf", "cell_states_vf"]:
+                self.__dict__[tensor] = self.__dict__[tensor].swapaxes(1, 2)
+
+            # flatten but keep the sequence order
+            # 1. (n_steps, n_envs, *tensor_shape) -> (n_envs, n_steps, *tensor_shape)
+            # 2. (n_envs, n_steps, *tensor_shape) -> (n_envs * n_steps, *tensor_shape)
+            for tensor in [
+                "observations",
+                "next_observations",
+                "actions",
+                "values",
+                "log_probs",
+                "advantages",
+                "returns",
+                "hidden_states_pi",
+                "cell_states_pi",
+                "hidden_states_vf",
+                "cell_states_vf",
+                "episode_starts",
+            ]:
+                self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
+            self.generator_ready = True
+
+        # Return everything, don't create minibatches
+        if batch_size is None:
+            batch_size = self.buffer_size * self.n_envs
+
+        # Sampling strategy that allows any mini batch size but requires
+        # more complexity and use of padding
+        # Trick to shuffle a bit: keep the sequence order
+        # but split the indices in two
+        split_index = np.random.randint(self.buffer_size * self.n_envs)
+        indices = np.arange(self.buffer_size * self.n_envs)
+        indices = np.concatenate((indices[split_index:], indices[:split_index]))
+
+        env_change = np.zeros(self.buffer_size * self.n_envs).reshape(self.buffer_size, self.n_envs)
+        # Flag first timestep as change of environment
+        env_change[0, :] = 1.0
+        env_change = self.swap_and_flatten(env_change)
+
+        start_idx = 0
+        while start_idx < self.buffer_size * self.n_envs:
+            batch_inds = indices[start_idx : start_idx + batch_size]
+            yield self._get_samples(batch_inds, env_change)
+            start_idx += batch_size
+
+    def _get_samples(
+        self,
+        batch_inds: np.ndarray,
+        env_change: np.ndarray,
+        env: Optional[VecNormalize] = None,
+    ) -> RecurrentRolloutBufferNextObsSamples:
+        # Retrieve sequence starts and utility function
+        self.seq_start_indices, self.pad, self.pad_and_flatten = create_sequencers(
+            self.episode_starts[batch_inds], env_change[batch_inds], self.device
+        )
+
+        # Number of sequences
+        n_seq = len(self.seq_start_indices)
+        max_length = self.pad(self.actions[batch_inds]).shape[1]
+        padded_batch_size = n_seq * max_length
+        # We retrieve the lstm hidden states that will allow
+        # to properly initialize the LSTM at the beginning of each sequence
+        lstm_states_pi = (
+            # 1. (n_envs * n_steps, n_layers, dim) -> (batch_size, n_layers, dim)
+            # 2. (batch_size, n_layers, dim)  -> (n_seq, n_layers, dim)
+            # 3. (n_seq, n_layers, dim) -> (n_layers, n_seq, dim)
+            self.hidden_states_pi[batch_inds][self.seq_start_indices].swapaxes(0, 1),
+            self.cell_states_pi[batch_inds][self.seq_start_indices].swapaxes(0, 1),
+        )
+        lstm_states_vf = (
+            # (n_envs * n_steps, n_layers, dim) -> (n_layers, n_seq, dim)
+            self.hidden_states_vf[batch_inds][self.seq_start_indices].swapaxes(0, 1),
+            self.cell_states_vf[batch_inds][self.seq_start_indices].swapaxes(0, 1),
+        )
+        lstm_states_pi = (self.to_torch(lstm_states_pi[0]).contiguous(), self.to_torch(lstm_states_pi[1]).contiguous())
+        lstm_states_vf = (self.to_torch(lstm_states_vf[0]).contiguous(), self.to_torch(lstm_states_vf[1]).contiguous())
+
+        return RecurrentRolloutBufferNextObsSamples(
+            # (batch_size, obs_dim) -> (n_seq, max_length, obs_dim) -> (n_seq * max_length, obs_dim)
+            observations=self.pad(self.observations[batch_inds]).reshape((padded_batch_size, *self.obs_shape)),
+            next_observations=self.pad(self.observations[batch_inds]).reshape((padded_batch_size, *self.obs_shape)),
+            actions=self.pad(self.actions[batch_inds]).reshape((padded_batch_size,) + self.actions.shape[1:]),
+            old_values=self.pad_and_flatten(self.values[batch_inds]),
+            old_log_prob=self.pad_and_flatten(self.log_probs[batch_inds]),
+            advantages=self.pad_and_flatten(self.advantages[batch_inds]),
+            returns=self.pad_and_flatten(self.returns[batch_inds]),
+            lstm_states=RNNStates(lstm_states_pi, lstm_states_vf),
+            episode_starts=self.pad_and_flatten(self.episode_starts[batch_inds]),
+            mask=self.pad_and_flatten(np.ones_like(self.returns[batch_inds])),
+        )
 
 class RecurrentDictRolloutBuffer(DictRolloutBuffer):
     """

@@ -14,7 +14,8 @@ from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedul
 from stable_baselines3.common.utils import explained_variance, get_schedule_fn, obs_as_tensor, safe_mean
 from stable_baselines3.common.vec_env import VecEnv
 
-from sb3_contrib.common.recurrent.buffers import RecurrentDictRolloutBuffer, RecurrentRolloutBuffer
+
+from sb3_contrib.common.recurrent.buffers import RecurrentDictRolloutBuffer, RecurrentRolloutBuffer, RecurrentRolloutBufferNextObs
 from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
 from sb3_contrib.common.recurrent.type_aliases import RNNStates
 from sb3_contrib.ppo_recurrent.policies import CnnLstmPolicy, MlpLstmPolicy, MultiInputLstmPolicy
@@ -138,6 +139,15 @@ class RecurrentPPO(OnPolicyAlgorithm):
 
         self._last_lstm_states = None
 
+        self.enable_curiosity = False
+        self.enable_ema = False
+
+        if policy_kwargs != None and 'enable_curiosity' in policy_kwargs:
+            self.enable_curiosity = policy_kwargs['enable_curiosity']
+
+        if policy_kwargs != None and 'enable_ema' in policy_kwargs:
+            self.enable_ema = policy_kwargs['enable_ema']
+
         if _init_setup_model:
             self._setup_model()
 
@@ -145,7 +155,12 @@ class RecurrentPPO(OnPolicyAlgorithm):
         self._setup_lr_schedule()
         self.set_random_seed(self.seed)
 
-        buffer_cls = RecurrentDictRolloutBuffer if isinstance(self.observation_space, spaces.Dict) else RecurrentRolloutBuffer
+        if isinstance(self.observation_space, spaces.Dict):
+            buffer_cls = RecurrentDictRolloutBuffer
+        elif self.enable_curiosity:
+            buffer_cls = RecurrentRolloutBufferNextObs
+        else:
+            buffer_cls = RecurrentRolloutBuffer
 
         self.policy = self.policy_class(
             self.observation_space,
@@ -218,7 +233,7 @@ class RecurrentPPO(OnPolicyAlgorithm):
             collected, False if callback terminated rollout prematurely.
         """
         assert isinstance(
-            rollout_buffer, (RecurrentRolloutBuffer, RecurrentDictRolloutBuffer)
+            rollout_buffer, (RecurrentRolloutBuffer, RecurrentDictRolloutBuffer, RecurrentRolloutBufferNextObs)
         ), f"{rollout_buffer} doesn't support recurrent policy"
 
         assert self._last_obs is not None, "No previous observation was provided"
@@ -246,6 +261,7 @@ class RecurrentPPO(OnPolicyAlgorithm):
                 episode_starts = th.tensor(self._last_episode_starts, dtype=th.float32, device=self.device)
                 actions, values, log_probs, lstm_states = self.policy.forward(obs_tensor, lstm_states, episode_starts)
 
+
             actions = actions.cpu().numpy()
 
             # Rescale and perform action
@@ -255,6 +271,49 @@ class RecurrentPPO(OnPolicyAlgorithm):
                 clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
 
             new_obs, rewards, dones, infos = env.step(clipped_actions)
+
+
+            #---------------------------------------------------------------------
+            # Curiosity Step Here
+            #---------------------------------------------------------------------
+            # load in Disagreement Agent
+            # calculate instrinsic reward
+                # e.g. curiosity step
+                    # compute bonus
+                    # ret: intrinsic_reward
+                    # add to reward
+            
+            # obs: n_envs, *self.obs_shape, (numpy_array)
+            # clipped_actions: buffer_size, n_envs, action_dim, (numpy_array)
+
+            # TODO check shape, data_type, magnitude
+            if self.enable_curiosity:
+                new_obs_tensor = obs_as_tensor(new_obs, self.device)
+                clipped_actions_tensor = th.as_tensor(clipped_actions, device=self.device)
+                int_reward = self.policy.curious_agent.compute_bonus(observations=obs_tensor, 
+                                                            next_observations=new_obs_tensor, 
+                                                            actions=clipped_actions_tensor)    # n_envs
+                int_reward = int_reward.detach().cpu().numpy()
+
+
+                rewards += int_reward 
+
+            #---------------------------------------------------------------------
+            # EMA step here
+            #---------------------------------------------------------------------
+
+            if self.enable_ema:
+                ht = lstm_states[0][0]
+                ema_rew = self.policy.ema_explorer.step(ht) #calc(lstm_states)
+                ema_rew = ema_rew.detach().cpu().numpy()
+                # print('in reward')
+                # print(rewards, ema_rew)
+                # print('-'*20)
+                rewards += ema_rew 
+
+            #---------------------------------------------------------------------
+
+
             # print('here: ', rewards.mean(), clipped_actions.mean())
             if env.reward_shaper != None:
                 rewards = env.reward_shaper(rewards)
@@ -291,15 +350,27 @@ class RecurrentPPO(OnPolicyAlgorithm):
                         terminal_value = self.policy.predict_values(terminal_obs, terminal_lstm_state, episode_starts)[0]
                     rewards[idx] += self.gamma * terminal_value
 
-            rollout_buffer.add(
-                self._last_obs,
-                actions,
-                rewards,
-                self._last_episode_starts,
-                values,
-                log_probs,
-                lstm_states=self._last_lstm_states,
-            )
+            if self.enable_curiosity:
+                rollout_buffer.add(
+                    self._last_obs,
+                    new_obs,    # next obs
+                    actions,
+                    rewards,
+                    self._last_episode_starts,
+                    values,
+                    log_probs,
+                    lstm_states=self._last_lstm_states,
+                )
+            else:
+                rollout_buffer.add(
+                    self._last_obs,
+                    actions,
+                    rewards,
+                    self._last_episode_starts,
+                    values,
+                    log_probs,
+                    lstm_states=self._last_lstm_states,
+                ) 
 
             self._last_obs = new_obs
             self._last_episode_starts = dones
@@ -334,7 +405,11 @@ class RecurrentPPO(OnPolicyAlgorithm):
         pg_losses, value_losses = [], []
         clip_fractions = []
 
+        if self.enable_curiosity:
+            forward_losses = []
+
         continue_training = True
+
 
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
@@ -405,6 +480,30 @@ class RecurrentPPO(OnPolicyAlgorithm):
 
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
 
+                #---------------------------------------------------------------------
+                # Curiosity Step Here
+                #---------------------------------------------------------------------
+                # TODO
+                # calculate dynamics loss (with curiosity inputs)
+                    # get curiosity loss
+                    # loss += curiosity loss
+                    # remember to log curiosity loss
+                
+                # observations: n_seq * max_length, obs_dim
+                # actions = n_seq * max_length, action_dim
+                # mask = n_seq * max_length
+
+                if self.enable_curiosity:
+                    forward_loss = self.policy.curious_agent.compute_loss(observations=rollout_data.observations, 
+                                                            next_observations=rollout_data.next_observations, 
+                                                            actions=rollout_data.actions, 
+                                                            valid=mask)
+                    forward_losses.append(forward_loss.item())
+                    loss += forward_loss
+
+                #---------------------------------------------------------------------
+
+
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
                 # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
@@ -447,6 +546,8 @@ class RecurrentPPO(OnPolicyAlgorithm):
 
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/clip_range", clip_range)
+        if self.enable_curiosity:
+            self.logger.record("train/disagree_forward_loss", np.mean(forward_losses))
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
 
