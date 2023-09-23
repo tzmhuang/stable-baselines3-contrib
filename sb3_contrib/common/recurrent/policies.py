@@ -436,9 +436,9 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
         at_goal_logit = self.at_goal_predictor(latent_pi) # n_envs, 2
 
-        # print('-'*20)
-        # print(at_goal_logit)
-        # print('-'*20)
+        print('-'*20)
+        print(at_goal_logit)
+        print('-'*20)
         at_goal_dist = self.at_goal_dist.proba_distribution(action_logits=at_goal_logit)
 
         return at_goal_dist, lstm_states
@@ -523,7 +523,9 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
 
         values = self.value_net(latent_vf)
-        return values, log_prob, distribution.entropy()
+        # return values, log_prob, distribution.entropy()
+        # NOTE: Add entropy for atGoal dist
+        return values, log_prob, distribution.entropy() + distribution.entropy()
 
     def _predict(
         self,
@@ -575,8 +577,8 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
         observation, vectorized_env = self.obs_to_tensor(observation)
 
-        print("-"*20)
-        print(observation[:,[2,3,5,6,7]])
+        # print("-"*20)
+        # print(observation[:,[2,3,5,6,7]])
 
         if isinstance(observation, dict):
             n_envs = observation[list(observation.keys())[0]].shape[0]
