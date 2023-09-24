@@ -163,23 +163,33 @@ class Disagreement(nn.Module):
 
 
 
-class EmaExplorer():
+class EmaExplorer(nn.Module):
     def __init__(self, n_envs, dim, rew_weight, p=1e-5):
+        super(EmaExplorer, self).__init__()
+        
         self.p = p
         self.rew_weight = rew_weight
-        self._means = None  # n_envs, dim
-        self._vars = None
+        # self._means = None  # n_envs, dim
+        # self._vars = None
+
+        # save as buffer
+        self.register_buffer("_means", torch.zeros(n_envs, dim, dtype = torch.float))
+        self.register_buffer("_vars", torch.ones(n_envs, dim, dtype = torch.float))
 
         self.initialized = False
         self.eps = 1e-6
         return
 
-    def step(self, state):
+    def forward(self, state):
         # state: (B, n_envs, dim) B=1
         # 
 
         self._means, self._vars = self._get_update_means_and_vars(state)
-        rew = -1 * self._get_gaussian_rew(state, self._means, torch.sqrt(self._vars))   # actually a punishment (1, n_envs, dim)
+        # rew = -1 * self._get_gaussian_rew(state, self._means, torch.sqrt(self._vars))   # actually a punishment (1, n_envs, dim)
+
+        # make it a reward instead:
+        max_ = self._get_gaussian_rew(state, torch.zeros_like(self._means), torch.sqrt(self._vars))
+        rew = max_ - self._get_gaussian_rew(state, self._means, torch.sqrt(self._vars))
 
         return rew.mean(-1).squeeze()   # (n_envs)
 

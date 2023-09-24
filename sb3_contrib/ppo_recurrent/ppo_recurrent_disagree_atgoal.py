@@ -322,7 +322,7 @@ class RecurrentPPO(OnPolicyAlgorithm):
 
             if self.enable_ema:
                 ht = lstm_states[0][0]
-                ema_rew = self.policy.ema_explorer.step(ht) #calc(lstm_states)
+                ema_rew = self.policy.ema_explorer(ht) #calc(lstm_states)
                 ema_rew = ema_rew.detach().cpu().numpy()
                 # print('in reward')
                 # print(rewards, ema_rew)

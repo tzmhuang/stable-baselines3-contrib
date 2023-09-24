@@ -210,7 +210,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         # Add ema module
         if self.enable_ema:
             assert self.ema_kwargs != None
-            self.ema_explorer = EmaExplorer(**ema_kwargs)
+            self.ema_explorer = EmaExplorer(**self.ema_kwargs)
         
         # Add at_goal module
         self.at_goal_predictor = AtGoalPredictor(self.lstm_output_dim, self.features_dim, output_dim=2) # 2-class
