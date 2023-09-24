@@ -188,7 +188,7 @@ class EmaExplorer(nn.Module):
         # rew = -1 * self._get_gaussian_rew(state, self._means, torch.sqrt(self._vars))   # actually a punishment (1, n_envs, dim)
 
         # make it a reward instead:
-        max_ = self._get_gaussian_rew(state, torch.zeros_like(self._means), torch.sqrt(self._vars))
+        max_ = self._get_gaussian_rew(torch.zeros_like(state), self._means, torch.sqrt(self._vars))
         rew = max_ - self._get_gaussian_rew(state, self._means, torch.sqrt(self._vars))
 
         return rew.mean(-1).squeeze()   # (n_envs)
